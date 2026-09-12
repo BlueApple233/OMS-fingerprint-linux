@@ -18,6 +18,10 @@ makepkg -fC            # 构建（再次构建必须加 -C，否则 prepare() �
 yes | sudo pacman -U libfprint-omsmoc-*.pkg.tar.zst
 ```
 
+> makepkg 会在本目录生成 `src/`、`pkg/`、源码 tarball 与 `*.pkg.tar.zst`。
+> 这些构建产物**不入库**（`.gitignore` 已覆盖 `/aur/**/src/`、`/aur/**/pkg/`、
+> `*.pkg.tar.zst`、`*.tar.gz`）；提交前用 `git status --short` 确认一下即可。
+
 ### 包装细节（实测踩过的坑）
 
 - `provides` 必须包含 soname：`provides=('libfprint' 'libfprint-2.so=2-64')`，
