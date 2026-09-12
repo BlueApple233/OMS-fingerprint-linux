@@ -18,7 +18,8 @@ pkgbase = libfprint-omsmoc
 	depends = pixman
 	depends = cairo
 	provides = libfprint
-	conflicts = libfprint
+	provides = libfprint-2.so=2-64
+	conflicts = libfprint>=1.90
 	options = !emptydirs
 	source = https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v1.94.100/libfprint-v1.94.100.tar.gz
 	source = omsmoc-driver.patch

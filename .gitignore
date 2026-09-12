@@ -41,6 +41,13 @@ __pycache__/
 # libfprint 源码树与 meson 构建产物（由 driver/setup.sh 生成，可随时重建）
 build/
 
+# --- AUR 构建产物（makepkg 生成，绝不入库）---
+/aur/**/src/
+/aur/**/pkg/
+/aur/**/*.pkg.tar.zst
+/aur/**/*.pkg.tar.xz
+/aur/**/*.tar.gz
+
 # --- 内部资料（本地保留，不上传公开仓库）---
 # 公开仓库只放对外材料：README/LICENSE + driver/（驱动、测试、上游补丁）+ aur/
 /ROADMAP.md

@@ -15,8 +15,10 @@ url="https://github.com/BlueApple233/OMS-fingerprint-linux"
 license=('LGPL-2.1-or-later')
 depends=('glib2' 'libgudev' 'libgusb' 'libusb' 'openssl' 'pixman' 'cairo')
 makedepends=('meson' 'ninja' 'gobject-introspection' 'glib2-devel')
-provides=('libfprint')
-conflicts=('libfprint')
+provides=('libfprint' 'libfprint-2.so=2-64')
+# 只与 libfprint 2.x 冲突：遗留的 libfprint-1（provides libfprint=1.0）可以被
+# fingerprint-gui 等包继续使用，不该被本包顶掉。
+conflicts=('libfprint>=1.90')
 options=('!emptydirs')
 source=("https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v$pkgver/libfprint-v$pkgver.tar.gz"
         "omsmoc-driver.patch")
