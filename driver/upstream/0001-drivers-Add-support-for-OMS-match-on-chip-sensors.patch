@@ -1,0 +1,3387 @@
+From dc3cc809537b2ec54e740b4e1f297ed6df9a2f24 Mon Sep 17 00:00:00 2001
+From: BlueApple233 <blueapple233_@outlook.com>
+Date: Sat, 12 Sep 2026 22:47:51 +0800
+Subject: [PATCH] drivers: Add support for OMS match-on-chip sensors
+
+The Jiangxi OMS Microelectronics fingerprint module (33a7:2388) is a
+match-on-chip sensor found in several laptops. It is accessed through a
+vendor specific USB interface with two bulk endpoints and does not have a
+driver in the kernel.
+
+The protocol was reverse engineered from the vendor's Windows driver and
+verified with USB captures of that driver as well as with a prototype on
+the real hardware. It is entirely plain text: no handshake, no key
+exchange and no encryption are used by the vendor driver either.
+
+Transport is two layered: an 8 byte "USBC" request header and a 4 byte
+"USBS" acknowledgement around 64 byte "EF01" frames, whose last two bytes
+carry a 16 bit checksum. Commands are 0x34 (chip serial number), 0x1d
+(template count), 0x1f (index table), 0x32 (identify), 0x31 (enroll),
+0x0c (delete/clear) and 0x30 (cancel).
+
+The chip stores up to 16 templates and does the matching itself, so the
+templates are opaque and no image processing is needed. The 0x32 result
+reports the slot that matched, which allows precise verification and
+identification even with several enrolled fingers; it is also used to
+reject duplicate enrollments.
+
+The index table is the source of truth for the stored prints.
+
+Tested with fprintd-enroll/fprintd-verify on the hardware and with the
+included umockdev test case (recorded with tests/create-driver-test.py,
+device identifying data removed).
+
+Co-authored-by: CommandCodeBot <noreply@commandcode.ai>
+---
+ data/autosuspend.hwdb      |    7 +-
+ libfprint/drivers/omsmoc.c | 1908 ++++++++++++++++++++++++++++++++++++
+ libfprint/drivers/omsmoc.h |   25 +
+ libfprint/meson.build      |    3 +
+ meson.build                |    1 +
+ tests/meson.build          |    1 +
+ tests/omsmoc/custom.pcapng |  Bin 0 -> 158108 bytes
+ tests/omsmoc/custom.py     |  107 ++
+ tests/omsmoc/device        |  332 +++++++
+ 9 files changed, 2382 insertions(+), 2 deletions(-)
+ create mode 100644 libfprint/drivers/omsmoc.c
+ create mode 100644 libfprint/drivers/omsmoc.h
+ create mode 100644 tests/omsmoc/custom.pcapng
+ create mode 100644 tests/omsmoc/custom.py
+ create mode 100644 tests/omsmoc/device
+
+diff --git a/data/autosuspend.hwdb b/data/autosuspend.hwdb
+index 104ce5e..0269464 100644
+--- a/data/autosuspend.hwdb
++++ b/data/autosuspend.hwdb
+@@ -267,6 +267,11 @@ usb:v3274p8012*
+  ID_AUTOSUSPEND=1
+  ID_PERSIST=0
+ 
++# Supported by libfprint driver omsmoc
++usb:v33A7p2388*
++ ID_AUTOSUSPEND=1
++ ID_PERSIST=0
++
+ # Supported by libfprint driver nb1010
+ usb:v298Dp1010*
+ usb:v298Dp2020*
+@@ -556,8 +561,6 @@ usb:v2808pC652*
+ usb:v298Dp2033*
+ usb:v2DF0p0003*
+ usb:v3274p9008*
+-usb:v3274pB012*
+-usb:v33A7p2388*
+ usb:v3538p0930*
+  ID_AUTOSUSPEND=1
+  ID_PERSIST=0
+diff --git a/libfprint/drivers/omsmoc.c b/libfprint/drivers/omsmoc.c
+new file mode 100644
+index 0000000..f2fc6f3
+--- /dev/null
++++ b/libfprint/drivers/omsmoc.c
+@@ -0,0 +1,1908 @@
++/*
++ * OMS Match-on-Chip driver for libfprint
++ * Copyright (C) 2026 The OMS Linux driver contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * Reverse engineered driver for the Jiangxi OMS Microelectronics
++ * fingerprint module (33a7:2388).  The protocol was reconstructed from the
++ * vendor Windows driver and verified against usbmon captures of the vendor
++ * driver as well as with a pyusb prototype on the real hardware.
++ *
++ * The transport consists of two layers:
++ *
++ *   1. An 8 byte "USBC" request header (host -> device, bulk OUT):
++ *        55 53 42 43 | dir | size | 00 00
++ *        dir = 0x00: the host will write `size` bytes afterwards
++ *        dir = 0x80: request that the device returns at most `size` bytes
++ *      The device acknowledges every request with a 4 byte "USBS" reply.
++ *
++ *   2. A 64 byte EF01 frame, padded with 0x00:
++ *        EF 01 FF FF | FF FF | kind | 00 | L | data[L]
++ *        kind = 0x01 request / 0x07 response
++ *        the last two bytes of data are sum (frame[6 : 9 + L - 2]),
++ *        stored big endian.
++ *
++ * A command transaction is therefore:
++ *   OUT USBC(00, 64) -> OUT 64 byte command frame -> IN USBS
++ *   -> OUT USBC(80, 64) -> IN 64 byte response frame -> IN USBS
++ *
++ * The device answers a read request with the ack alone when it has no data
++ * to report yet.  Identify results are polled with 32 byte windows.
++ *
++ * Everything runs in plain text: neither the vendor driver nor this driver
++ * performs a handshake, a key exchange or any encryption.
++ */
++
++#define FP_COMPONENT "omsmoc"
++
++#include "drivers_api.h"
++
++#include "omsmoc.h"
++
++/* USB identifiers */
++#define OMS_VENDOR_ID  0x33a7
++#define OMS_PRODUCT_ID 0x2388
++
++/* Bulk endpoints */
++#define OMS_EP_OUT (0x01 | FPI_USB_ENDPOINT_OUT)
++#define OMS_EP_IN  (0x81 | FPI_USB_ENDPOINT_IN)
++
++/* Transport layer */
++#define OMS_USBC_SIZE   8
++#define OMS_USBS_SIZE   4
++#define OMS_DIR_WRITE   0x00
++#define OMS_DIR_READ    0x80
++#define OMS_PACKET_SIZE 64
++#define OMS_POLL_SIZE   32
++
++/* EF01 frame */
++#define OMS_FRAME_HEADER_SIZE   9
++#define OMS_FRAME_TRAILER_SIZE  2
++#define OMS_FRAME_KIND_REQUEST  0x01
++#define OMS_FRAME_KIND_RESPONSE 0x07
++#define OMS_MAX_PARAM_SIZE      (OMS_PACKET_SIZE - OMS_FRAME_HEADER_SIZE - 1 - OMS_FRAME_TRAILER_SIZE)
++
++/* Timeouts and pacing (the vendor driver polls the device every ~60 ms) */
++#define OMS_CMD_TIMEOUT_MS    2000
++#define OMS_POLL_TIMEOUT_MS   200
++#define OMS_READ_DELAY_MS     60
++#define OMS_POLL_INTERVAL_MS  60
++#define OMS_MAX_SESSION_RETRY 10
++#define OMS_MAX_READ_RETRY    5
++#define OMS_MAX_DRAIN_READS   8
++#define OMS_MAX_CAPTURE_POLLS     1200  /* ~72 s waiting for a finger press */
++#define OMS_MAX_CAPTURE_END_POLLS 30    /* ~1.8 s to finish the capture */
++#define OMS_MAX_ENROLL_POLLS      1200  /* ~72 s between two finger presses */
++
++/* Number of finger presses the chip expects during enrollment */
++#define OMS_ENROLL_STAGES 6
++
++/* Commands (all verified against usbmon captures of the vendor driver) */
++typedef enum {
++  OMS_CMD_TEMPLATE_OP  = 0x0c,
++  OMS_CMD_TEMPLATE_NUM = 0x1d,
++  OMS_CMD_INDEX_TABLE  = 0x1f,
++  OMS_CMD_CANCEL       = 0x30,
++  OMS_CMD_ENROLL       = 0x31,
++  OMS_CMD_IDENTIFY     = 0x32,
++  OMS_CMD_CHIP_SN      = 0x34,
++} OmsCommand;
++
++/* AutoIdentify (0x32) response payloads, verified on hardware:
++ *
++ *   00 00 XX XX 00 00   waiting for a finger (XX XX echoes the parameters)
++ *   00 01 XX XX 00 00   finger image captured, the result is still pending
++ *   00 05 00 SS 03 e8   matched an enrolled template, SS is its slot
++ *   09 05 FF FF 00 00   the search finished without a match
++ *
++ * Note that "00 01" alone does *not* mean that the finger was recognised:
++ * an unenrolled finger produces it as well, followed by "09 05". The two
++ * parameter bytes are echoed by the chip but do not restrict the search.
++ */
++#define OMS_ID_STATUS_OK      0x00
++#define OMS_ID_STATUS_NOMATCH 0x09
++#define OMS_ID_RESULT_CAPTURED 0x01
++#define OMS_ID_RESULT_MATCHED  0x05
++#define OMS_ID_PAYLOAD_SLOT    3
++
++/* Enroll progress matrix */
++#define OMS_ENROLL_TRAILER_INDEX 6
++
++struct _FpiDeviceOmsMoc
++{
++  FpDevice parent;
++
++  FpiSsm   *task_ssm;
++
++  /* Buffers of the transaction currently on the wire */
++  guint8    usbc[OMS_USBC_SIZE];
++  guint8    out_frame[OMS_PACKET_SIZE];
++  guint8    in_data[OMS_PACKET_SIZE];
++  gsize     in_len;
++  guint8    ack[OMS_USBS_SIZE];
++
++  /* Cached device state */
++  guint8    nr_templates;
++  guint16   template_bitmap;
++
++  /* Identify/verify bookkeeping */
++  gint      matched_slot;       /* slot the chip matched, -1 for "no match" */
++  gboolean  result_received;
++  GError   *action_error;
++  guint     session_retries;
++  guint     read_retries;
++
++  /* Enroll bookkeeping */
++  gboolean  captured;
++  guint8    enroll_slot;
++  guint8    enroll_level;
++  guint     poll_count;
++  guint     capture_retries;
++};
++
++G_DEFINE_TYPE (FpiDeviceOmsMoc, fpi_device_omsmoc, FP_TYPE_DEVICE)
++
++typedef void (*OmsCallback) (FpiDeviceOmsMoc *self, GError *error);
++
++/* ------------------------------------------------------------------ *
++ * Protocol helpers
++ * ------------------------------------------------------------------ */
++
++static void
++oms_fill_usbc (guint8 *buf,
++               guint8  direction,
++               guint8  size)
++{
++  buf[0] = 'U';
++  buf[1] = 'S';
++  buf[2] = 'B';
++  buf[3] = 'C';
++  buf[4] = direction;
++  buf[5] = size;
++  buf[6] = 0x00;
++  buf[7] = 0x00;
++}
++
++static gsize
++oms_build_frame (guint8        *buf,
++                 guint8         cmd,
++                 const guint8  *params,
++                 gsize          params_len)
++{
++  gsize len;
++  gsize i;
++  guint16 checksum = 0;
++
++  g_return_val_if_fail (params_len <= OMS_MAX_PARAM_SIZE, 0);
++
++  len = 1 + params_len + OMS_FRAME_TRAILER_SIZE;
++
++  memset (buf, 0x00, OMS_PACKET_SIZE);
++  buf[0] = 0xef;
++  buf[1] = 0x01;
++  buf[2] = 0xff;
++  buf[3] = 0xff;
++  buf[4] = 0xff;
++  buf[5] = 0xff;
++  buf[6] = OMS_FRAME_KIND_REQUEST;
++  buf[7] = 0x00;
++  buf[8] = len;
++  buf[9] = cmd;
++  if (params_len > 0)
++    memcpy (&buf[10], params, params_len);
++
++  for (i = 6; i < OMS_FRAME_HEADER_SIZE + len - OMS_FRAME_TRAILER_SIZE; i++)
++    checksum += buf[i];
++
++  buf[OMS_FRAME_HEADER_SIZE + len - 2] = (checksum >> 8) & 0xff;
++  buf[OMS_FRAME_HEADER_SIZE + len - 1] = checksum & 0xff;
++
++  return OMS_FRAME_HEADER_SIZE + len;
++}
++
++static gboolean
++oms_parse_frame (const guint8  *buf,
++                 gsize          buf_len,
++                 const guint8 **payload,
++                 gsize         *payload_len)
++{
++  gsize frame_len;
++  gsize i;
++  guint16 checksum = 0;
++  guint16 expected;
++
++  if (buf_len < OMS_FRAME_HEADER_SIZE)
++    return FALSE;
++
++  if (buf[0] != 0xef || buf[1] != 0x01 || buf[2] != 0xff || buf[3] != 0xff ||
++      buf[4] != 0xff || buf[5] != 0xff || buf[6] != OMS_FRAME_KIND_RESPONSE)
++    return FALSE;
++
++  frame_len = buf[8];
++  if (frame_len < OMS_FRAME_TRAILER_SIZE ||
++      OMS_FRAME_HEADER_SIZE + frame_len > buf_len)
++    return FALSE;
++
++  for (i = 6; i < OMS_FRAME_HEADER_SIZE + frame_len - OMS_FRAME_TRAILER_SIZE; i++)
++    checksum += buf[i];
++
++  expected = (buf[OMS_FRAME_HEADER_SIZE + frame_len - 2] << 8) |
++             buf[OMS_FRAME_HEADER_SIZE + frame_len - 1];
++  if (checksum != expected)
++    {
++      fp_warn ("Response frame checksum mismatch (0x%04x != 0x%04x)",
++               checksum, expected);
++      return FALSE;
++    }
++
++  *payload = &buf[OMS_FRAME_HEADER_SIZE];
++  *payload_len = frame_len - OMS_FRAME_TRAILER_SIZE;
++
++  return TRUE;
++}
++
++/* The device pads its answers to the requested window size and reports
++ * "nothing to say" with an all zero packet. */
++static gboolean
++oms_data_is_empty (const guint8 *data,
++                   gsize         len)
++{
++  gsize i;
++
++  for (i = 0; i < len; i++)
++    {
++      if (data[i] != 0x00)
++        return FALSE;
++    }
++
++  return TRUE;
++}
++
++/* ------------------------------------------------------------------ *
++ * USB transfers
++ * ------------------------------------------------------------------ */
++
++typedef struct
++{
++  OmsCallback callback;
++  guint       window;
++  guint       timeout_ms;
++  gboolean    cancelable;
++} OmsTransferData;
++
++static void
++oms_usbs_cb (FpiUsbTransfer *transfer,
++             FpDevice       *device,
++             gpointer        user_data,
++             GError         *error)
++{
++  if (error)
++    {
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++
++  if (transfer->actual_length != OMS_USBS_SIZE ||
++      memcmp (transfer->buffer, "USBS", OMS_USBS_SIZE) != 0)
++    {
++      fpi_ssm_mark_failed (transfer->ssm,
++                           fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                     "Invalid USBS acknowledgement"));
++      return;
++    }
++
++  fpi_ssm_next_state (transfer->ssm);
++}
++
++/* Command transfers: USBC write header + command frame + USBS, followed by
++ * an optional response read (USBC read header + data + USBS). */
++enum {
++  OMS_CMD_SEND_HEADER,
++  OMS_CMD_SEND_FRAME,
++  OMS_CMD_WAIT_ACK,
++  OMS_CMD_READ_DELAY,
++  OMS_CMD_SEND_READ_HEADER,
++  OMS_CMD_READ_DATA,
++  OMS_CMD_READ_ACK,
++  OMS_CMD_COMPLETE,
++  OMS_CMD_NUM_STATES,
++};
++
++/* Read transfers: USBC read header + data + USBS */
++enum {
++  OMS_READ_SEND_HEADER,
++  OMS_READ_WAIT_DATA,
++  OMS_READ_WAIT_ACK,
++  OMS_READ_COMPLETE,
++  OMS_READ_NUM_STATES,
++};
++
++static void
++oms_data_cb (FpiUsbTransfer *transfer,
++             FpDevice       *device,
++             gpointer        user_data,
++             GError         *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  gint final_state = GPOINTER_TO_INT (user_data);
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++
++  self->in_len = transfer->actual_length;
++
++  /* The device may answer a read request with the ack alone, in which case
++   * no separate USBS transfer follows. */
++  if (self->in_len == OMS_USBS_SIZE &&
++      memcmp (self->in_data, "USBS", OMS_USBS_SIZE) == 0)
++    {
++      self->in_len = 0;
++      fpi_ssm_jump_to_state (transfer->ssm, final_state);
++      return;
++    }
++
++  fpi_ssm_next_state (transfer->ssm);
++}
++
++static void
++oms_cmd_data_cb (FpiUsbTransfer *transfer,
++                 FpDevice       *device,
++                 gpointer        user_data,
++                 GError         *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++
++  self->in_len = transfer->actual_length;
++
++  if (self->in_len == OMS_USBS_SIZE &&
++      memcmp (self->in_data, "USBS", OMS_USBS_SIZE) == 0)
++    {
++      self->in_len = 0;
++      fpi_ssm_jump_to_state (transfer->ssm, OMS_CMD_COMPLETE);
++      return;
++    }
++
++  if ((self->in_len == 0 || oms_data_is_empty (self->in_data, self->in_len)) &&
++      self->read_retries++ < OMS_MAX_READ_RETRY)
++    {
++      /* The device was not ready to answer yet, ask again. */
++      fpi_ssm_jump_to_state_delayed (transfer->ssm, OMS_CMD_SEND_READ_HEADER,
++                                     OMS_READ_DELAY_MS);
++      return;
++    }
++
++  fpi_ssm_next_state (transfer->ssm);
++}
++
++static void
++oms_cmd_run_state (FpiSsm   *ssm,
++                   FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  OmsTransferData *data = fpi_ssm_get_data (ssm);
++  FpiUsbTransfer *transfer;
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_CMD_SEND_HEADER:
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = TRUE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_OUT, self->usbc,
++                                       OMS_USBC_SIZE, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms, NULL,
++                               fpi_ssm_usb_transfer_cb, NULL);
++      break;
++
++    case OMS_CMD_SEND_FRAME:
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = TRUE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_OUT, self->out_frame,
++                                       OMS_PACKET_SIZE, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms, NULL,
++                               fpi_ssm_usb_transfer_cb, NULL);
++      break;
++
++    case OMS_CMD_WAIT_ACK:
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = TRUE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_IN, self->ack,
++                                       OMS_USBS_SIZE, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms, NULL,
++                               oms_usbs_cb, NULL);
++      break;
++
++    case OMS_CMD_READ_DELAY:
++      if (data->window == 0)
++        {
++          fpi_ssm_jump_to_state (ssm, OMS_CMD_COMPLETE);
++          break;
++        }
++
++      /* The device needs a moment to prepare the response; the vendor
++       * driver waits about 64 ms before it requests it. */
++      self->read_retries = 0;
++      fpi_ssm_next_state_delayed (ssm, OMS_READ_DELAY_MS);
++      break;
++
++    case OMS_CMD_SEND_READ_HEADER:
++      oms_fill_usbc (self->usbc, OMS_DIR_READ, data->window);
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = TRUE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_OUT, self->usbc,
++                                       OMS_USBC_SIZE, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms, NULL,
++                               fpi_ssm_usb_transfer_cb, NULL);
++      break;
++
++    case OMS_CMD_READ_DATA:
++      self->in_len = 0;
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = FALSE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_IN, self->in_data,
++                                       data->window, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms, NULL,
++                               oms_cmd_data_cb, NULL);
++      break;
++
++    case OMS_CMD_READ_ACK:
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = TRUE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_IN, self->ack,
++                                       OMS_USBS_SIZE, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms, NULL,
++                               oms_usbs_cb, NULL);
++      break;
++
++    case OMS_CMD_COMPLETE:
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_read_run_state (FpiSsm   *ssm,
++                    FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  OmsTransferData *data = fpi_ssm_get_data (ssm);
++  FpiUsbTransfer *transfer;
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_READ_SEND_HEADER:
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = TRUE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_OUT, self->usbc,
++                                       OMS_USBC_SIZE, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms, NULL,
++                               fpi_ssm_usb_transfer_cb, NULL);
++      break;
++
++    case OMS_READ_WAIT_DATA:
++      self->in_len = 0;
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = FALSE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_IN, self->in_data,
++                                       data->window, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms,
++                               data->cancelable ? fpi_device_get_cancellable (device) : NULL,
++                               oms_data_cb, GINT_TO_POINTER (OMS_READ_COMPLETE));
++      break;
++
++    case OMS_READ_WAIT_ACK:
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = TRUE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_IN, self->ack,
++                                       OMS_USBS_SIZE, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms, NULL,
++                               oms_usbs_cb, NULL);
++      break;
++
++    case OMS_READ_COMPLETE:
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_cmd_ssm_done (FpiSsm   *ssm,
++                  FpDevice *device,
++                  GError   *error)
++{
++  OmsTransferData *data = fpi_ssm_get_data (ssm);
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  if (data->callback)
++    data->callback (self, error);
++}
++
++static void
++oms_read_ssm_done (FpiSsm   *ssm,
++                   FpDevice *device,
++                   GError   *error)
++{
++  OmsTransferData *data = fpi_ssm_get_data (ssm);
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  if (data->callback)
++    data->callback (self, error);
++}
++
++static void
++oms_command (FpiDeviceOmsMoc *self,
++             guint8           cmd,
++             const guint8    *params,
++             gsize            params_len,
++             guint8           window,
++             OmsCallback      callback)
++{
++  FpiSsm *ssm;
++  OmsTransferData *data;
++
++  oms_build_frame (self->out_frame, cmd, params, params_len);
++  oms_fill_usbc (self->usbc, OMS_DIR_WRITE, OMS_PACKET_SIZE);
++
++  data = g_new0 (OmsTransferData, 1);
++  data->callback = callback;
++  data->window = window;
++  data->timeout_ms = OMS_CMD_TIMEOUT_MS;
++
++  ssm = fpi_ssm_new (FP_DEVICE (self), oms_cmd_run_state, OMS_CMD_NUM_STATES);
++  fpi_ssm_set_data (ssm, data, g_free);
++
++  fpi_ssm_start (ssm, oms_cmd_ssm_done);
++}
++
++static void
++oms_read (FpiDeviceOmsMoc *self,
++          guint8           window,
++          guint            timeout_ms,
++          gboolean         cancelable,
++          OmsCallback      callback)
++{
++  FpiSsm *ssm;
++  OmsTransferData *data;
++
++  g_return_if_fail (window <= OMS_PACKET_SIZE);
++
++  oms_fill_usbc (self->usbc, OMS_DIR_READ, window);
++
++  data = g_new0 (OmsTransferData, 1);
++  data->callback = callback;
++  data->window = window;
++  data->timeout_ms = timeout_ms;
++  data->cancelable = cancelable;
++
++  ssm = fpi_ssm_new (FP_DEVICE (self), oms_read_run_state, OMS_READ_NUM_STATES);
++  fpi_ssm_set_data (ssm, data, g_free);
++
++  fpi_ssm_start (ssm, oms_read_ssm_done);
++}
++
++/* ------------------------------------------------------------------ *
++ * Initialization
++ * ------------------------------------------------------------------ */
++
++enum {
++  OMS_INIT_DRAIN,
++  OMS_INIT_CHIP_SN,
++  OMS_INIT_TEMPLATE_NUM,
++  OMS_INIT_INDEX_TABLE,
++  OMS_INIT_NUM_STATES,
++};
++
++static void
++oms_init_cb (FpiDeviceOmsMoc *self,
++             GError          *error)
++{
++  FpiSsm *ssm = self->task_ssm;
++  const guint8 *payload;
++  gsize payload_len;
++
++  if (error)
++    {
++      /* A timeout while draining just means that there was nothing left. */
++      if (fpi_ssm_get_cur_state (ssm) == OMS_INIT_DRAIN &&
++          g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
++        {
++          g_error_free (error);
++          fpi_ssm_next_state (ssm);
++          return;
++        }
++
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_INIT_DRAIN:
++      /* Discard whatever a previous session left in the device queue. */
++      if (!oms_data_is_empty (self->in_data, self->in_len) &&
++          self->read_retries++ < OMS_MAX_DRAIN_READS)
++        {
++          fp_dbg ("Draining stale device data");
++          fpi_ssm_jump_to_state (ssm, OMS_INIT_DRAIN);
++          return;
++        }
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_INIT_CHIP_SN:
++      if (oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) &&
++          payload_len > 1)
++        {
++          g_autofree gchar *sn = NULL;
++
++          /* [推测] The response mirrors 0x1f: a status byte followed by the
++           * 32 byte chip serial number. */
++          sn = g_strndup ((const gchar *) &payload[1], payload_len - 1);
++          fp_info ("Chip serial: %s", sn);
++        }
++      else
++        {
++          fp_warn ("No chip serial number reported");
++        }
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_INIT_TEMPLATE_NUM:
++      if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++          payload_len < 3)
++        {
++          fpi_ssm_mark_failed (ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "Failed to read the template count"));
++          return;
++        }
++
++      self->nr_templates = payload[2];
++      fp_info ("%d template(s) stored on the chip", self->nr_templates);
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_INIT_INDEX_TABLE:
++      if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++          payload_len < 3)
++        {
++          fpi_ssm_mark_failed (ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "Failed to read the index table"));
++          return;
++        }
++
++      self->template_bitmap = payload[1] | (payload[2] << 8);
++      fp_info ("Template bitmap: 0x%04x", self->template_bitmap);
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_init_run_state (FpiSsm   *ssm,
++                    FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  const guint8 p_zero = 0x00;
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_INIT_DRAIN:
++      oms_read (self, OMS_PACKET_SIZE, 100, FALSE, oms_init_cb);
++      break;
++
++    case OMS_INIT_CHIP_SN:
++      oms_command (self, OMS_CMD_CHIP_SN, &p_zero, 1, OMS_PACKET_SIZE, oms_init_cb);
++      break;
++
++    case OMS_INIT_TEMPLATE_NUM:
++      oms_command (self, OMS_CMD_TEMPLATE_NUM, NULL, 0, OMS_PACKET_SIZE, oms_init_cb);
++      break;
++
++    case OMS_INIT_INDEX_TABLE:
++      oms_command (self, OMS_CMD_INDEX_TABLE, &p_zero, 1, OMS_PACKET_SIZE, oms_init_cb);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++/* ------------------------------------------------------------------ *
++ * Print data helpers
++ * ------------------------------------------------------------------ */
++
++/* Templates live in 16 chip slots; the slot number is the only identity we
++ * can store, as the chip does not keep any user metadata. */
++#define OMS_NR_SLOTS 16
++
++static GVariant *
++oms_print_data_new (guint16 slot)
++{
++  return g_variant_new ("(q)", slot);
++}
++
++static gboolean
++oms_print_data_get_slot (GVariant *data,
++                         guint16  *slot)
++{
++  if (!data || !g_variant_check_format_string (data, "(q)", FALSE))
++    return FALSE;
++
++  g_variant_get (data, "(q)", slot);
++
++  return TRUE;
++}
++
++static gboolean
++oms_print_get_slot (FpPrint *print,
++                    guint16 *slot)
++{
++  g_autoptr(GVariant) data = NULL;
++
++  g_object_get (print, "fpi-data", &data, NULL);
++
++  return oms_print_data_get_slot (data, slot);
++}
++
++static FpPrint *
++oms_print_from_slot (FpiDeviceOmsMoc *self,
++                     guint16          slot)
++{
++  FpPrint *print;
++  g_autofree gchar *description = NULL;
++
++  print = fp_print_new (FP_DEVICE (self));
++
++  fpi_print_set_type (print, FPI_PRINT_RAW);
++  fpi_print_set_device_stored (print, TRUE);
++  g_object_set (print, "fpi-data", oms_print_data_new (slot), NULL);
++
++  description = g_strdup_printf ("Slot %u", slot);
++  g_object_set (print, "description", description, NULL);
++
++  return print;
++}
++
++/* ------------------------------------------------------------------ *
++ * Identify / verify
++ * ------------------------------------------------------------------ */
++
++enum {
++  OMS_VERIFY_PRE_DRAIN,
++  OMS_VERIFY_START,
++  OMS_VERIFY_WAIT,
++  OMS_VERIFY_CANCEL,
++  OMS_VERIFY_DRAIN,
++  OMS_VERIFY_NUM_STATES,
++};
++
++static void
++oms_verify_cb (FpiDeviceOmsMoc *self,
++               GError          *error)
++{
++  FpiSsm *ssm = self->task_ssm;
++  const guint8 *payload;
++  gsize payload_len;
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_VERIFY_PRE_DRAIN:
++      /* Drop frames of a previous session before starting a new one. */
++      if (error)
++        {
++          g_error_free (error);
++          fpi_ssm_next_state (ssm);
++          break;
++        }
++
++      if (!oms_data_is_empty (self->in_data, self->in_len) &&
++          self->poll_count++ < OMS_MAX_DRAIN_READS)
++        {
++          fp_dbg ("Draining stale device data before the session");
++          fpi_ssm_jump_to_state (ssm, OMS_VERIFY_PRE_DRAIN);
++          break;
++        }
++
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_VERIFY_START:
++      if (error)
++        {
++          fpi_ssm_mark_failed (ssm, error);
++          return;
++        }
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_VERIFY_WAIT:
++      if (error)
++        {
++          if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED) ||
++              g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_CANCELLED))
++            {
++              self->action_error = g_steal_pointer (&error);
++              fpi_ssm_jump_to_state (ssm, OMS_VERIFY_CANCEL);
++              return;
++            }
++
++          /* No answer inside the poll window: keep polling. */
++          if (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
++            {
++              g_error_free (error);
++              fpi_ssm_jump_to_state_delayed (ssm, OMS_VERIFY_WAIT, OMS_POLL_INTERVAL_MS);
++              return;
++            }
++
++          fpi_ssm_mark_failed (ssm, error);
++          return;
++        }
++
++      if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++          payload_len < 2)
++        {
++          /* Nothing (or nothing useful) to report yet. */
++          fpi_ssm_jump_to_state_delayed (ssm, OMS_VERIFY_WAIT, OMS_POLL_INTERVAL_MS);
++          return;
++        }
++
++      fp_dbg ("Identify payload: %02x %02x (%" G_GSIZE_FORMAT " bytes)",
++              payload[0], payload[1], payload_len);
++
++      if (payload[0] == OMS_ID_STATUS_OK && payload[1] == OMS_ID_RESULT_CAPTURED)
++        {
++          /* The finger image was captured; the chip reports the match
++           * result in the next frame(s). */
++          fpi_device_report_finger_status_changes (FP_DEVICE (self),
++                                                   FP_FINGER_STATUS_PRESENT,
++                                                   FP_FINGER_STATUS_NEEDED);
++          fpi_ssm_jump_to_state_delayed (ssm, OMS_VERIFY_WAIT, OMS_POLL_INTERVAL_MS);
++          return;
++        }
++
++      if (payload[0] == OMS_ID_STATUS_OK && payload[1] == OMS_ID_RESULT_MATCHED &&
++          payload_len > OMS_ID_PAYLOAD_SLOT)
++        {
++          self->matched_slot = payload[OMS_ID_PAYLOAD_SLOT];
++          self->result_received = TRUE;
++          fp_info ("Chip matched template in slot %d", self->matched_slot);
++          fpi_ssm_jump_to_state (ssm, OMS_VERIFY_CANCEL);
++          return;
++        }
++
++      if (payload[0] == OMS_ID_STATUS_NOMATCH)
++        {
++          self->matched_slot = -1;
++          self->result_received = TRUE;
++          fp_dbg ("Chip found no matching template");
++          fpi_ssm_jump_to_state (ssm, OMS_VERIFY_CANCEL);
++          return;
++        }
++
++      /* Still waiting for a finger. */
++      fpi_device_report_finger_status_changes (FP_DEVICE (self),
++                                               FP_FINGER_STATUS_NEEDED,
++                                               FP_FINGER_STATUS_NONE);
++      fpi_ssm_jump_to_state_delayed (ssm, OMS_VERIFY_WAIT, OMS_POLL_INTERVAL_MS);
++      break;
++
++    case OMS_VERIFY_CANCEL:
++      if (error)
++        fp_dbg ("Cancelling the session failed: %s", error->message);
++      self->poll_count = 0;
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_VERIFY_DRAIN:
++      /* The chip may still report the end of the previous session; drop
++       * those frames so that the next command starts from a clean queue. */
++      if (error)
++        {
++          fp_dbg ("Drain read failed: %s", error->message);
++          fpi_ssm_mark_completed (ssm);
++          break;
++        }
++
++      if (!oms_data_is_empty (self->in_data, self->in_len) &&
++          self->poll_count++ < OMS_MAX_DRAIN_READS)
++        {
++          fpi_ssm_jump_to_state (ssm, OMS_VERIFY_DRAIN);
++          break;
++        }
++
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_verify_run_state (FpiSsm   *ssm,
++                      FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  static const guint8 identify_params[] = { 0x05, 0xff, 0xff, 0x00, 0x00 };
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_VERIFY_PRE_DRAIN:
++      self->poll_count = 0;
++      oms_read (self, OMS_PACKET_SIZE, OMS_POLL_TIMEOUT_MS, FALSE, oms_verify_cb);
++      break;
++
++    case OMS_VERIFY_START:
++      fpi_device_report_finger_status_changes (device,
++                                               FP_FINGER_STATUS_NEEDED,
++                                               FP_FINGER_STATUS_NONE);
++      oms_command (self, OMS_CMD_IDENTIFY, identify_params,
++                   G_N_ELEMENTS (identify_params), 0, oms_verify_cb);
++      break;
++
++    case OMS_VERIFY_WAIT:
++      oms_read (self, OMS_POLL_SIZE, OMS_POLL_TIMEOUT_MS, TRUE, oms_verify_cb);
++      break;
++
++    case OMS_VERIFY_CANCEL:
++      fpi_device_report_finger_status_changes (device,
++                                               FP_FINGER_STATUS_NONE,
++                                               FP_FINGER_STATUS_NEEDED);
++      oms_command (self, OMS_CMD_CANCEL, NULL, 0, 0, oms_verify_cb);
++      break;
++
++    case OMS_VERIFY_DRAIN:
++      oms_read (self, OMS_PACKET_SIZE, OMS_POLL_TIMEOUT_MS, FALSE, oms_verify_cb);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_identify_ssm_done (FpiSsm   *ssm,
++                       FpDevice *device,
++                       GError   *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  FpPrint *match = NULL;
++  GPtrArray *gallery = NULL;
++  guint i;
++
++  self->task_ssm = NULL;
++
++  if (self->action_error)
++    {
++      fpi_device_identify_complete (device, g_steal_pointer (&self->action_error));
++      return;
++    }
++
++  if (error)
++    {
++      fpi_device_identify_complete (device, error);
++      return;
++    }
++
++  if (self->matched_slot >= 0)
++    {
++      fpi_device_get_identify_data (device, &gallery);
++
++      for (i = 0; i < gallery->len; i++)
++        {
++          FpPrint *print = g_ptr_array_index (gallery, i);
++          guint16 slot;
++
++          if (oms_print_get_slot (print, &slot) && slot == self->matched_slot)
++            {
++              match = print;
++              break;
++            }
++        }
++
++      if (!match)
++        fp_warn ("The chip matched slot %d, which is not part of the gallery",
++                 self->matched_slot);
++    }
++
++  fpi_device_identify_report (device, match, NULL, NULL);
++  fpi_device_identify_complete (device, NULL);
++}
++
++static void
++oms_identify (FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  self->matched_slot = -1;
++  self->result_received = FALSE;
++  self->session_retries = 0;
++  g_clear_pointer (&self->action_error, g_error_free);
++
++  self->task_ssm = fpi_ssm_new (device, oms_verify_run_state,
++                                OMS_VERIFY_NUM_STATES);
++  fpi_ssm_start (self->task_ssm, oms_identify_ssm_done);
++}
++
++static void
++oms_verify_ssm_done (FpiSsm   *ssm,
++                     FpDevice *device,
++                     GError   *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  FpPrint *enrolled_print = NULL;
++  guint16 slot = 0;
++
++  self->task_ssm = NULL;
++
++  if (self->action_error)
++    {
++      fpi_device_verify_complete (device, g_steal_pointer (&self->action_error));
++      return;
++    }
++
++  if (error)
++    {
++      fpi_device_verify_complete (device, error);
++      return;
++    }
++
++  fpi_device_get_verify_data (device, &enrolled_print);
++
++  /* Only a match in the slot of the requested print counts as a success;
++   * the chip searches all its templates, so another enrolled finger would
++   * otherwise be reported as a match. */
++  if (self->matched_slot >= 0 && oms_print_get_slot (enrolled_print, &slot) &&
++      slot == self->matched_slot)
++    fpi_device_verify_report (device, FPI_MATCH_SUCCESS, NULL, NULL);
++  else
++    fpi_device_verify_report (device, FPI_MATCH_FAIL, NULL, NULL);
++
++  fpi_device_verify_complete (device, NULL);
++}
++
++static void
++oms_verify (FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  FpPrint *enrolled_print = NULL;
++  guint16 slot = 0;
++
++  fpi_device_get_verify_data (device, &enrolled_print);
++
++  if (!oms_print_get_slot (enrolled_print, &slot))
++    {
++      fpi_device_verify_complete (device,
++                                  fpi_device_error_new (FP_DEVICE_ERROR_DATA_INVALID));
++      return;
++    }
++
++  self->matched_slot = -1;
++  self->result_received = FALSE;
++  self->session_retries = 0;
++  g_clear_pointer (&self->action_error, g_error_free);
++
++  self->task_ssm = fpi_ssm_new (device, oms_verify_run_state,
++                                OMS_VERIFY_NUM_STATES);
++  fpi_ssm_start (self->task_ssm, oms_verify_ssm_done);
++}
++
++/* ------------------------------------------------------------------ *
++ * Enrollment
++ * ------------------------------------------------------------------ */
++
++enum {
++  OMS_ENROLL_CAPTURE,
++  OMS_ENROLL_CAPTURE_POLL,
++  OMS_ENROLL_SLOT,
++  OMS_ENROLL_BUILD,
++  OMS_ENROLL_PROGRESS,
++  OMS_ENROLL_CONFIRM_NUM,
++  OMS_ENROLL_CONFIRM_TABLE,
++  OMS_ENROLL_CANCEL,
++  OMS_ENROLL_NUM_STATES,
++};
++
++static gboolean
++oms_find_free_slot (FpiDeviceOmsMoc *self,
++                    guint8          *slot)
++{
++  guint i;
++
++  for (i = 0; i < OMS_NR_SLOTS; i++)
++    {
++      if (!(self->template_bitmap & (1 << i)))
++        {
++          *slot = i;
++          return TRUE;
++        }
++    }
++
++  return FALSE;
++}
++
++static void
++oms_enroll_ssm_done (FpiSsm   *ssm,
++                     FpDevice *device,
++                     GError   *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  FpPrint *print = NULL;
++
++  self->task_ssm = NULL;
++
++  fpi_device_report_finger_status_changes (device,
++                                           FP_FINGER_STATUS_NONE,
++                                           FP_FINGER_STATUS_PRESENT |
++                                           FP_FINGER_STATUS_NEEDED);
++
++  if (self->action_error)
++    {
++      fpi_device_enroll_complete (device, NULL, g_steal_pointer (&self->action_error));
++      return;
++    }
++
++  if (error)
++    {
++      fpi_device_enroll_complete (device, NULL, error);
++      return;
++    }
++
++  fpi_device_get_enroll_data (device, &print);
++  fp_dbg ("Enroll done for slot %u, print %p", self->enroll_slot, print);
++  fpi_print_set_type (print, FPI_PRINT_RAW);
++  fpi_print_set_device_stored (print, TRUE);
++  g_object_set (print, "fpi-data", oms_print_data_new (self->enroll_slot), NULL);
++
++  fp_info ("Enrollment complete, template stored in slot %u", self->enroll_slot);
++
++  fpi_device_enroll_complete (device, g_object_ref (print), NULL);
++  fp_dbg ("Enrollment completion reported");
++}
++
++static void
++oms_enroll_cb (FpiDeviceOmsMoc *self,
++               GError          *error)
++{
++  FpiSsm *ssm = self->task_ssm;
++  const guint8 *payload;
++  gsize payload_len;
++  guint8 status, result;
++
++  if (error)
++    {
++      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED) ||
++          g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_CANCELLED))
++        {
++          self->action_error = g_steal_pointer (&error);
++          fpi_ssm_jump_to_state (ssm, OMS_ENROLL_CANCEL);
++          return;
++        }
++
++      if (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
++        {
++          g_error_free (error);
++          error = NULL;
++        }
++      else
++        {
++          fpi_ssm_mark_failed (ssm, error);
++          return;
++        }
++    }
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_ENROLL_CAPTURE:
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_ENROLL_CAPTURE_POLL:
++      if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++          payload_len < 2)
++        {
++          if (self->poll_count++ > OMS_MAX_CAPTURE_POLLS)
++            {
++              fpi_ssm_mark_failed (ssm,
++                                   fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
++              return;
++            }
++          fpi_ssm_jump_to_state_delayed (ssm, OMS_ENROLL_CAPTURE_POLL, OMS_POLL_INTERVAL_MS);
++          return;
++        }
++
++      status = payload[0];
++      result = payload[1];
++
++      if (status == OMS_ID_STATUS_OK && result == OMS_ID_RESULT_CAPTURED)
++        {
++          fp_dbg ("Finger captured, waiting for the search result");
++          self->captured = TRUE;
++          self->poll_count = 0;
++          fpi_device_report_finger_status_changes (FP_DEVICE (self),
++                                                   FP_FINGER_STATUS_PRESENT,
++                                                   FP_FINGER_STATUS_NEEDED);
++          fpi_ssm_jump_to_state_delayed (ssm, OMS_ENROLL_CAPTURE_POLL, OMS_POLL_INTERVAL_MS);
++          return;
++        }
++
++      /* The chip always searches its templates first: a match means that
++       * this finger is already enrolled and must not be added again. */
++      if (status == OMS_ID_STATUS_OK && result == OMS_ID_RESULT_MATCHED &&
++          payload_len > OMS_ID_PAYLOAD_SLOT)
++        {
++          fpi_ssm_mark_failed (ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_DUPLICATE,
++                                                         "Finger is already enrolled in slot %u",
++                                                         payload[OMS_ID_PAYLOAD_SLOT]));
++          return;
++        }
++
++      if (status == OMS_ID_STATUS_NOMATCH)
++        {
++          if (!self->captured)
++            {
++              /* The chip gave up without an image, ask for another press. */
++              if (self->capture_retries++ < OMS_MAX_SESSION_RETRY)
++                {
++                  fpi_ssm_jump_to_state_delayed (ssm, OMS_ENROLL_CAPTURE, OMS_POLL_INTERVAL_MS);
++                  return;
++                }
++
++              fpi_ssm_mark_failed (ssm,
++                                   fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
++              return;
++            }
++
++          fpi_ssm_next_state (ssm);
++          return;
++        }
++
++      /* Not ready yet, or still capturing. */
++      if (self->captured && self->poll_count++ > OMS_MAX_CAPTURE_END_POLLS)
++        {
++          fp_dbg ("No capture result notification, continuing anyway");
++          fpi_ssm_next_state (ssm);
++          return;
++        }
++
++      fpi_ssm_jump_to_state_delayed (ssm, OMS_ENROLL_CAPTURE_POLL, OMS_POLL_INTERVAL_MS);
++      break;
++
++    case OMS_ENROLL_SLOT:
++      if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++          payload_len < 3)
++        {
++          fpi_ssm_mark_failed (ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "Failed to read the index table"));
++          return;
++        }
++
++      self->template_bitmap = payload[1] | (payload[2] << 8);
++
++      if (!oms_find_free_slot (self, &self->enroll_slot))
++        {
++          fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_DATA_FULL));
++          return;
++        }
++
++      fp_info ("Enrolling into slot %u", self->enroll_slot);
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_ENROLL_BUILD:
++      self->enroll_level = 0;
++      self->poll_count = 0;
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_ENROLL_PROGRESS:
++      if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++          payload_len < 3)
++        {
++          if (self->poll_count++ > OMS_MAX_ENROLL_POLLS)
++            {
++              fpi_ssm_mark_failed (ssm,
++                                   fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                             "Enrollment timed out"));
++              return;
++            }
++          fpi_ssm_jump_to_state_delayed (ssm, OMS_ENROLL_PROGRESS, OMS_POLL_INTERVAL_MS);
++          return;
++        }
++
++      fp_dbg ("Enroll progress: %02x %02x %02x", payload[0], payload[1], payload[2]);
++
++      if (payload[1] >= 1 && payload[1] <= 3 &&
++          payload[2] >= 1 && payload[2] <= OMS_ENROLL_STAGES &&
++          payload[2] > self->enroll_level)
++        {
++          self->enroll_level = payload[2];
++          fpi_device_enroll_progress (FP_DEVICE (self), self->enroll_level, NULL, NULL);
++
++          /* Each level needs a new finger press, ask for the next one. */
++          fpi_device_report_finger_status_changes (FP_DEVICE (self),
++                                                   FP_FINGER_STATUS_NEEDED,
++                                                   FP_FINGER_STATUS_PRESENT);
++        }
++      else
++        {
++          fpi_device_report_finger_status_changes (FP_DEVICE (self),
++                                                   FP_FINGER_STATUS_PRESENT,
++                                                   FP_FINGER_STATUS_NONE);
++        }
++
++      if (payload[1] == OMS_ENROLL_TRAILER_INDEX)
++        {
++          fpi_ssm_next_state (ssm);
++          return;
++        }
++
++      fpi_ssm_jump_to_state_delayed (ssm, OMS_ENROLL_PROGRESS, OMS_POLL_INTERVAL_MS);
++      break;
++
++    case OMS_ENROLL_CONFIRM_NUM:
++      if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++          payload_len < 3)
++        {
++          fpi_ssm_mark_failed (ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "Failed to verify the enrollment"));
++          return;
++        }
++
++      self->nr_templates = payload[2];
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_ENROLL_CONFIRM_TABLE:
++      if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++          payload_len < 3)
++        {
++          fpi_ssm_mark_failed (ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "Failed to verify the enrollment"));
++          return;
++        }
++
++      self->template_bitmap = payload[1] | (payload[2] << 8);
++
++      if (!(self->template_bitmap & (1 << self->enroll_slot)))
++        {
++          fpi_ssm_mark_failed (ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "The chip did not store the template"));
++          return;
++        }
++
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    case OMS_ENROLL_CANCEL:
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_enroll_run_state (FpiSsm   *ssm,
++                      FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  static const guint8 identify_params[] = { 0x05, 0xff, 0xff, 0x00, 0x00 };
++  const guint8 p_zero = 0x00;
++  guint8 build_params[] = { 0x00, 0x00, OMS_ENROLL_STAGES, 0x00, 0x00 };
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_ENROLL_CAPTURE:
++      self->poll_count = 0;
++      fpi_device_report_finger_status_changes (device,
++                                               FP_FINGER_STATUS_NEEDED,
++                                               FP_FINGER_STATUS_NONE);
++      oms_command (self, OMS_CMD_IDENTIFY, identify_params,
++                   G_N_ELEMENTS (identify_params), 0, oms_enroll_cb);
++      break;
++
++    case OMS_ENROLL_CAPTURE_POLL:
++      oms_read (self, OMS_POLL_SIZE, OMS_POLL_TIMEOUT_MS, TRUE, oms_enroll_cb);
++      break;
++
++    case OMS_ENROLL_SLOT:
++      oms_command (self, OMS_CMD_INDEX_TABLE, &p_zero, 1, OMS_PACKET_SIZE, oms_enroll_cb);
++      break;
++
++    case OMS_ENROLL_BUILD:
++      build_params[1] = self->enroll_slot;
++      oms_command (self, OMS_CMD_ENROLL, build_params,
++                   G_N_ELEMENTS (build_params), 0, oms_enroll_cb);
++      break;
++
++    case OMS_ENROLL_PROGRESS:
++      oms_read (self, OMS_POLL_SIZE, OMS_POLL_TIMEOUT_MS, TRUE, oms_enroll_cb);
++      break;
++
++    case OMS_ENROLL_CONFIRM_NUM:
++      oms_command (self, OMS_CMD_TEMPLATE_NUM, NULL, 0, OMS_PACKET_SIZE, oms_enroll_cb);
++      break;
++
++    case OMS_ENROLL_CONFIRM_TABLE:
++      oms_command (self, OMS_CMD_INDEX_TABLE, &p_zero, 1, OMS_PACKET_SIZE, oms_enroll_cb);
++      break;
++
++    case OMS_ENROLL_CANCEL:
++      oms_command (self, OMS_CMD_CANCEL, NULL, 0, 0, oms_enroll_cb);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_enroll (FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  self->captured = FALSE;
++  self->enroll_slot = 0;
++  self->enroll_level = 0;
++  self->capture_retries = 0;
++  g_clear_pointer (&self->action_error, g_error_free);
++
++  self->task_ssm = fpi_ssm_new (device, oms_enroll_run_state, OMS_ENROLL_NUM_STATES);
++  fpi_ssm_start (self->task_ssm, oms_enroll_ssm_done);
++}
++
++/* ------------------------------------------------------------------ *
++ * Delete / list
++ * ------------------------------------------------------------------ */
++
++enum {
++  OMS_DELETE_SEND,
++  OMS_DELETE_COMPLETE,
++  OMS_DELETE_NUM_STATES,
++};
++
++static void
++oms_delete_cb (FpiDeviceOmsMoc *self,
++               GError          *error)
++{
++  FpiSsm *ssm = self->task_ssm;
++  const guint8 *payload;
++  gsize payload_len;
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  if (fpi_ssm_get_cur_state (ssm) == OMS_DELETE_SEND)
++    {
++      if (oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len))
++        fp_dbg ("Delete response: %02x", payload[0]);
++      fpi_ssm_next_state (ssm);
++      return;
++    }
++
++  fpi_ssm_mark_completed (ssm);
++}
++
++static void
++oms_delete_run_state (FpiSsm   *ssm,
++                      FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  guint8 params[] = { 0x00, 0x00, 0x00, 0x01 };
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_DELETE_SEND:
++      params[1] = self->enroll_slot;
++      fp_info ("Deleting template in slot %u", self->enroll_slot);
++      oms_command (self, OMS_CMD_TEMPLATE_OP, params, G_N_ELEMENTS (params),
++                   OMS_PACKET_SIZE, oms_delete_cb);
++      break;
++
++    case OMS_DELETE_COMPLETE:
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_delete_ssm_done (FpiSsm   *ssm,
++                     FpDevice *device,
++                     GError   *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  self->task_ssm = NULL;
++  fpi_device_delete_complete (device, error);
++}
++
++static void
++oms_delete (FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  FpPrint *print = NULL;
++  g_autoptr(GVariant) data = NULL;
++  guint16 slot;
++
++  fpi_device_get_delete_data (device, &print);
++  g_object_get (print, "fpi-data", &data, NULL);
++
++  if (!oms_print_data_get_slot (data, &slot))
++    {
++      fpi_device_delete_complete (device,
++                                  fpi_device_error_new (FP_DEVICE_ERROR_DATA_INVALID));
++      return;
++    }
++
++  self->enroll_slot = slot;
++  self->task_ssm = fpi_ssm_new (device, oms_delete_run_state, OMS_DELETE_NUM_STATES);
++  fpi_ssm_start (self->task_ssm, oms_delete_ssm_done);
++}
++
++enum {
++  OMS_CLEAR_SEND,
++  OMS_CLEAR_COMPLETE,
++  OMS_CLEAR_NUM_STATES,
++};
++
++static void
++oms_clear_cb (FpiDeviceOmsMoc *self,
++              GError          *error)
++{
++  FpiSsm *ssm = self->task_ssm;
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  if (fpi_ssm_get_cur_state (ssm) == OMS_CLEAR_SEND)
++    {
++      fpi_ssm_next_state (ssm);
++      return;
++    }
++
++  fpi_ssm_mark_completed (ssm);
++}
++
++static void
++oms_clear_run_state (FpiSsm   *ssm,
++                     FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  static const guint8 params[] = { 0x00, 0x00, 0x00, 0x1e };
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_CLEAR_SEND:
++      fp_info ("Clearing the template storage");
++      oms_command (self, OMS_CMD_TEMPLATE_OP, params, G_N_ELEMENTS (params),
++                   OMS_PACKET_SIZE, oms_clear_cb);
++      break;
++
++    case OMS_CLEAR_COMPLETE:
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_clear_ssm_done (FpiSsm   *ssm,
++                    FpDevice *device,
++                    GError   *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  self->task_ssm = NULL;
++
++  if (!error)
++    {
++      self->template_bitmap = 0;
++      self->nr_templates = 0;
++    }
++
++  fpi_device_clear_storage_complete (device, error);
++}
++
++static void
++oms_clear_storage (FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  self->task_ssm = fpi_ssm_new (device, oms_clear_run_state, OMS_CLEAR_NUM_STATES);
++  fpi_ssm_start (self->task_ssm, oms_clear_ssm_done);
++}
++
++static void
++oms_list_cb (FpiDeviceOmsMoc *self,
++             GError          *error)
++{
++  const guint8 *payload;
++  gsize payload_len;
++  g_autoptr(GPtrArray) gallery = NULL;
++  guint i;
++
++  if (error)
++    {
++      fpi_device_list_complete (FP_DEVICE (self), NULL, error);
++      self->task_ssm = NULL;
++      return;
++    }
++
++  if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++      payload_len < 3)
++    {
++      fpi_device_list_complete (FP_DEVICE (self), NULL,
++                                fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                          "Failed to read the index table"));
++      self->task_ssm = NULL;
++      return;
++    }
++
++  self->template_bitmap = payload[1] | (payload[2] << 8);
++  self->nr_templates = 0;
++
++  gallery = g_ptr_array_new_with_free_func (g_object_unref);
++
++  for (i = 0; i < OMS_NR_SLOTS; i++)
++    {
++      if (self->template_bitmap & (1 << i))
++        {
++          self->nr_templates++;
++          g_ptr_array_add (gallery, g_object_ref_sink (oms_print_from_slot (self, i)));
++        }
++    }
++
++  fp_info ("%u template(s) in the chip storage", self->nr_templates);
++
++  self->task_ssm = NULL;
++  fpi_device_list_complete (FP_DEVICE (self), g_steal_pointer (&gallery), NULL);
++}
++
++static void
++oms_list_run_state (FpiSsm   *ssm,
++                    FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  const guint8 p_zero = 0x00;
++
++  oms_command (self, OMS_CMD_INDEX_TABLE, &p_zero, 1, OMS_PACKET_SIZE, oms_list_cb);
++}
++
++static void
++oms_list_ssm_done (FpiSsm   *ssm,
++                   FpDevice *device,
++                   GError   *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  self->task_ssm = NULL;
++
++  if (error)
++    fpi_device_list_complete (device, NULL, error);
++}
++
++static void
++oms_list (FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  self->task_ssm = fpi_ssm_new (device, oms_list_run_state, 1);
++  fpi_ssm_start (self->task_ssm, oms_list_ssm_done);
++}
++
++/* ------------------------------------------------------------------ *
++ * Device lifecycle
++ * ------------------------------------------------------------------ */
++
++static void
++oms_probe (FpDevice *device)
++{
++  g_autoptr(GError) error = NULL;
++  g_autofree gchar *serial = NULL;
++  GUsbDevice *usb_dev = fpi_device_get_usb_device (device);
++
++  if (!g_usb_device_open (usb_dev, &error))
++    {
++      fpi_device_probe_complete (device, NULL, NULL, g_steal_pointer (&error));
++      return;
++    }
++
++  if (!g_usb_device_claim_interface (usb_dev, 0, 0, &error))
++    {
++      g_usb_device_close (usb_dev, NULL);
++      fpi_device_probe_complete (device, NULL, NULL, g_steal_pointer (&error));
++      return;
++    }
++
++  serial = g_usb_device_get_string_descriptor (
++    usb_dev, g_usb_device_get_serial_number_index (usb_dev), &error);
++  g_usb_device_release_interface (usb_dev, 0, 0, NULL);
++  g_usb_device_close (usb_dev, NULL);
++
++  if (serial)
++    fp_info ("Device serial: %s", serial);
++
++  fpi_device_probe_complete (device, serial, NULL, NULL);
++}
++
++static void
++oms_init_ssm_done (FpiSsm   *ssm,
++                   FpDevice *device,
++                   GError   *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  self->task_ssm = NULL;
++  fpi_device_open_complete (device, error);
++}
++
++static void
++oms_open (FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  g_autoptr(GError) error = NULL;
++  GUsbDevice *usb_dev = fpi_device_get_usb_device (device);
++
++  if (!g_usb_device_claim_interface (usb_dev, 0, 0, &error))
++    {
++      fpi_device_open_complete (device, g_steal_pointer (&error));
++      return;
++    }
++
++  fpi_device_set_nr_enroll_stages (device, OMS_ENROLL_STAGES);
++
++  self->read_retries = 0;
++  self->task_ssm = fpi_ssm_new (device, oms_init_run_state, OMS_INIT_NUM_STATES);
++  fpi_ssm_start (self->task_ssm, oms_init_ssm_done);
++}
++
++static void
++oms_close_ssm_done (FpiSsm   *ssm,
++                    FpDevice *device,
++                    GError   *error)
++{
++  GUsbDevice *usb_dev = fpi_device_get_usb_device (device);
++  g_autoptr(GError) release_error = NULL;
++
++  g_usb_device_release_interface (usb_dev, 0, 0, &release_error);
++
++  if (error == NULL)
++    error = g_steal_pointer (&release_error);
++
++  fpi_device_close_complete (device, error);
++}
++
++static void
++oms_close_cb (FpiDeviceOmsMoc *self,
++              GError          *error)
++{
++  if (error)
++    fp_dbg ("Cancelling the session failed: %s", error->message);
++
++  fpi_ssm_mark_completed (self->task_ssm);
++}
++
++static void
++oms_close_run_state (FpiSsm   *ssm,
++                     FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  oms_command (self, OMS_CMD_CANCEL, NULL, 0, 0, oms_close_cb);
++}
++
++static void
++oms_close (FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  g_clear_error (&self->action_error);
++
++  self->task_ssm = fpi_ssm_new (device, oms_close_run_state, 1);
++  fpi_ssm_start (self->task_ssm, oms_close_ssm_done);
++}
++
++/* ------------------------------------------------------------------ *
++ * GObject boilerplate
++ * ------------------------------------------------------------------ */
++
++static const FpIdEntry id_table[] = {
++  { .vid = OMS_VENDOR_ID, .pid = OMS_PRODUCT_ID },
++  { .vid = 0, .pid = 0, .driver_data = 0 },     /* terminating entry */
++};
++
++static void
++fpi_device_omsmoc_init (FpiDeviceOmsMoc *self)
++{
++}
++
++static void
++fpi_device_omsmoc_class_init (FpiDeviceOmsMocClass *klass)
++{
++  FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
++
++  dev_class->id = FP_COMPONENT;
++  dev_class->full_name = "OMS Match-on-Chip Fingerprint Sensor";
++  dev_class->type = FP_DEVICE_TYPE_USB;
++  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
++  dev_class->id_table = id_table;
++  dev_class->nr_enroll_stages = OMS_ENROLL_STAGES;
++  dev_class->temp_hot_seconds = -1;
++
++  dev_class->probe = oms_probe;
++  dev_class->open = oms_open;
++  dev_class->close = oms_close;
++  dev_class->enroll = oms_enroll;
++  dev_class->identify = oms_identify;
++  dev_class->verify = oms_verify;
++  dev_class->list = oms_list;
++  dev_class->delete = oms_delete;
++  dev_class->clear_storage = oms_clear_storage;
++
++  fpi_device_class_auto_initialize_features (dev_class);
++
++  /* The chip searches all its templates before an enrollment, so an
++   * already enrolled finger can be detected. */
++  dev_class->features |= FP_DEVICE_FEATURE_DUPLICATES_CHECK;
++}
+diff --git a/libfprint/drivers/omsmoc.h b/libfprint/drivers/omsmoc.h
+new file mode 100644
+index 0000000..92bd5a8
+--- /dev/null
++++ b/libfprint/drivers/omsmoc.h
+@@ -0,0 +1,25 @@
++/*
++ * OMS Match-on-Chip driver for libfprint
++ * Copyright (C) 2026 The OMS Linux driver contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#pragma once
++
++#include "fpi-device.h"
++#include "fpi-ssm.h"
++
++G_DECLARE_FINAL_TYPE (FpiDeviceOmsMoc, fpi_device_omsmoc, FPI, DEVICE_OMS_MOC, FpDevice)
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index f11533c..208d8b4 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -134,6 +134,9 @@ driver_sources = {
+         'drivers/goodixmoc/goodix.c',
+         'drivers/goodixmoc/goodix_proto.c',
+     ),
++    'omsmoc' : files(
++        'drivers/omsmoc.c',
++    ),
+     'fpcmoc' : files('drivers/fpcmoc/fpc.c'),
+     'realtek' : files('drivers/realtek/realtek.c'),
+     'focaltech_moc' : files('drivers/focaltech_moc/focaltech_moc.c'),
+diff --git a/meson.build b/meson.build
+index ab09dc1..f6c736e 100644
+--- a/meson.build
++++ b/meson.build
+@@ -141,6 +141,7 @@ drivers_info = {
+     'upeksonly': {},
+     'upekts': {},
+     'goodixmoc': {},
++    'omsmoc': {},
+     'nb1010': {},
+     'fpcmoc': {},
+     'realtek': {},
+diff --git a/tests/meson.build b/tests/meson.build
+index d218e04..20f6972 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -63,6 +63,7 @@ drivers_tests = {
+     'focaltech_moc': { 'timeout': 30 },
+     'focaltech_moc-6553': {},
+     'mafpmoc': {},
++    'omsmoc': { 'timeout': 30 },
+     'secugen': {},
+ }
+ 
+diff --git a/tests/omsmoc/custom.pcapng b/tests/omsmoc/custom.pcapng
+new file mode 100644
+index 0000000000000000000000000000000000000000..c217a5824d08ecbfdb06582b6a89e98b7aed9460
+GIT binary patch
+literal 158108
+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
+bh_nbZA3ZHTgt{MOJ_v)1M8Qz=VdWwKhIzM#
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/omsmoc/custom.py b/tests/omsmoc/custom.py
+new file mode 100644
+index 0000000..1ce06e4
+--- /dev/null
++++ b/tests/omsmoc/custom.py
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python3
++#
++# omsmoc (OMS Match-on-Chip) umockdev test
++# Copyright (C) 2026 The OMS Linux driver contributors
++#
++# This library is free software; you can redistribute it and/or
++# modify it under the terms of the GNU Lesser General Public
++# License as published by the Free Software Foundation; either
++# version 2.1 of the License, or (at your option) any later version.
++#
++# This test is run against the real hardware while recording (see
++# tests/create-driver-test.py) and against the recorded USB traffic
++# afterwards.  Everything here is read-only with respect to the chip
++# storage, so recording the test never modifies an enrolled template.
++
++import sys
++import traceback
++
++import gi
++
++gi.require_version('FPrint', '2.0')
++from gi.repository import FPrint, GLib
++
++# Exit with error on any exception, including those happening in async callbacks
++sys.excepthook = lambda *args: (traceback.print_exception(*args), sys.exit(1))
++
++ctx = GLib.main_context_default()
++
++c = FPrint.Context()
++c.enumerate()
++devices = c.get_devices()
++
++assert len(devices) == 1, 'Expected exactly one supported device'
++d = devices[0]
++del devices
++
++assert d.get_driver() == 'omsmoc'
++assert not d.has_feature(FPrint.DeviceFeature.CAPTURE)
++assert d.has_feature(FPrint.DeviceFeature.IDENTIFY)
++assert d.has_feature(FPrint.DeviceFeature.VERIFY)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE_LIST)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE_DELETE)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE_CLEAR)
++assert d.get_scan_type() == FPrint.ScanType.PRESS
++assert d.get_nr_enroll_stages() == 6
++
++d.open_sync()
++
++# The chip storage is only read here: listing the templates reads the
++# index table (0x1f) and reports one print per occupied slot.
++print('listing templates')
++stored = d.list_prints_sync()
++print('device reports %d template(s)' % len(stored))
++assert len(stored) > 0, 'No template enrolled on the chip'
++
++def verify_with_retries(fp_print, attempts=3):
++    for attempt in range(attempts):
++        print('verifying, press the finger for %s (attempt %d/%d)'
++              % (fp_print.get_description(), attempt + 1, attempts))
++        res, _print = d.verify_sync(fp_print)
++        if res:
++            return True
++        print('the chip did not match the finger, try again')
++
++    return False
++
++
++# Verification of the first stored print.  The chip reports the slot it
++# matched, and the driver only reports a match if that slot is the one of
++# the requested print.
++assert verify_with_retries(stored[0]), 'The enrolled finger was not recognised'
++print('verify matched')
++
++# Identification reports the print whose slot the chip matched.
++identified = {'done': False, 'match': None}
++
++
++def identify_done(dev, res):
++    try:
++        match, _print = dev.identify_finish(res)
++        identified['match'] = match
++    except GLib.Error as err:
++        identified['error'] = err.message
++    finally:
++        identified['done'] = True
++
++
++for attempt in range(3):
++    identified.update({'done': False, 'match': None})
++    print('identifying, press an enrolled finger again (attempt %d/3)' % (attempt + 1))
++    d.identify(stored, callback=identify_done)
++    while not identified['done']:
++        ctx.iteration(True)
++
++    assert 'error' not in identified, identified.get('error')
++    if identified['match'] is not None:
++        break
++
++assert identified['match'] is not None, 'No match reported'
++print('identify matched')
++
++d.close_sync()
++
++del d
++del c
++del stored
+diff --git a/tests/omsmoc/device b/tests/omsmoc/device
+new file mode 100644
+index 0000000..6a283f3
+--- /dev/null
++++ b/tests/omsmoc/device
+@@ -0,0 +1,332 @@
++P: /devices/pci0000:00/0000:00:08.1/0000:63:00.3/usb1/1-4
++N: bus/usb/001/008=1201000200000040A733882300020102030109022000010100A0FA0904000002DCA0B0000705810240000007050102400000
++E: BUSNUM=001
++E: CURRENT_TAGS=:seat:uaccess:
++E: DEVNAME=/dev/bus/usb/001/008
++E: DEVNUM=008
++E: DEVTYPE=usb_device
++E: DRIVER=usb
++E: ID_AUTOSUSPEND=1
++E: ID_BUS=usb
++E: ID_FOR_SEAT=usb-pci-0000_63_00_3-usb-0_4
++E: ID_INTEGRATION=internal
++E: ID_MODEL=fingerprint_module
++E: ID_MODEL_ENC=fingerprint\x20module
++E: ID_MODEL_ID=2388
++E: ID_PATH=pci-0000:63:00.3-usb-0:4
++E: ID_PATH_TAG=pci-0000_63_00_3-usb-0_4
++E: ID_PATH_WITH_USB_REVISION=pci-0000:63:00.3-usbv2-0:4
++E: ID_PERSIST=0
++E: ID_REVISION=0200
++E: ID_SERIAL=Jiangxi_OMS_Microelectronics_Co._Ltd._fingerprint_module_oms-test-dev000
++E: ID_SERIAL_SHORT=oms-test-dev000
++E: ID_USB_INTERFACES=:dca0b0:
++E: ID_USB_MODEL=fingerprint_module
++E: ID_USB_MODEL_ENC=fingerprint\x20module
++E: ID_USB_MODEL_ID=2388
++E: ID_USB_REVISION=0200
++E: ID_USB_SERIAL=Jiangxi_OMS_Microelectronics_Co._Ltd._fingerprint_module_oms-test-dev000
++E: ID_USB_SERIAL_SHORT=oms-test-dev000
++E: ID_USB_VENDOR=Jiangxi_OMS_Microelectronics_Co._Ltd.
++E: ID_USB_VENDOR_ENC=Jiangxi\x20OMS\x20Microelectronics\x20Co.\x2cLtd.
++E: ID_USB_VENDOR_ID=33a7
++E: ID_VENDOR=Jiangxi_OMS_Microelectronics_Co._Ltd.
++E: ID_VENDOR_ENC=Jiangxi\x20OMS\x20Microelectronics\x20Co.\x2cLtd.
++E: ID_VENDOR_ID=33a7
++E: MAJOR=189
++E: MINOR=7
++E: PRODUCT=33a7/2388/200
++E: SUBSYSTEM=usb
++E: TAGS=:seat:uaccess:
++E: TYPE=0/0/0
++A: authorized=1\n
++A: avoid_reset_quirk=0\n
++A: bConfigurationValue=1\n
++A: bDeviceClass=00\n
++A: bDeviceProtocol=00\n
++A: bDeviceSubClass=00\n
++A: bMaxPacketSize0=64\n
++A: bMaxPower=500mA\n
++A: bNumConfigurations=1\n
++A: bNumInterfaces= 1\n
++A: bcdDevice=0200\n
++A: bmAttributes=a0\n
++A: busnum=1\n
++A: configuration=
++H: descriptors=1201000200000040A733882300020102030109022000010100A0FA0904000002DCA0B0000705810240000007050102400000
++A: dev=189:7\n
++A: devnum=8\n
++A: devpath=4\n
++L: driver=../../../../../../bus/usb/drivers/usb
++L: firmware_node=../../../../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:17/device:23/device:24/device:28
++A: idProduct=2388\n
++A: idVendor=33a7\n
++A: ltm_capable=no\n
++A: manufacturer=Jiangxi OMS Microelectronics Co.,Ltd.\n
++A: maxchild=0\n
++A: physical_location/dock=no\n
++A: physical_location/horizontal_position=center\n
++A: physical_location/lid=no\n
++A: physical_location/panel=left\n
++A: physical_location/vertical_position=center\n
++L: port=../1-0:1.0/usb1-port4
++A: power/active_duration=3566314\n
++A: power/autosuspend=2\n
++A: power/autosuspend_delay_ms=2000\n
++A: power/connected_duration=3566314\n
++A: power/control=on\n
++A: power/level=on\n
++A: power/persist=0\n
++A: power/runtime_active_time=3566067\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=0\n
++A: power/wakeup=disabled\n
++A: power/wakeup_abort_count=\n
++A: power/wakeup_active=\n
++A: power/wakeup_active_count=\n
++A: power/wakeup_count=\n
++A: power/wakeup_expire_count=\n
++A: power/wakeup_last_time_ms=\n
++A: power/wakeup_max_time_ms=\n
++A: power/wakeup_total_time_ms=\n
++A: product=fingerprint module\n
++A: quirks=0x0\n
++A: removable=fixed\n
++A: rx_lanes=1\n
++A: serial=oms-test-dev00000
++A: speed=12\n
++A: tx_lanes=1\n
++A: urbnum=32511\n
++A: version= 2.00\n
++
++P: /devices/pci0000:00/0000:00:08.1/0000:63:00.3/usb1
++N: bus/usb/001/001=12010002090001406B1D020002070302010109021900010100E0000904000001090000000705810304000C
++E: BUSNUM=001
++E: CURRENT_TAGS=:seat:
++E: DEVNAME=/dev/bus/usb/001/001
++E: DEVNUM=001
++E: DEVTYPE=usb_device
++E: DRIVER=usb
++E: ID_AUTOSUSPEND=1
++E: ID_BUS=usb
++E: ID_FOR_SEAT=usb-pci-0000_63_00_3
++E: ID_MODEL=xHCI_Host_Controller
++E: ID_MODEL_ENC=xHCI\x20Host\x20Controller
++E: ID_MODEL_FROM_DATABASE=2.0 root hub
++E: ID_MODEL_ID=0002
++E: ID_PATH=pci-0000:63:00.3
++E: ID_PATH_TAG=pci-0000_63_00_3
++E: ID_REVISION=0702
++E: ID_SERIAL=Linux_7.2.4-arch1-2_xhci-hcd_xHCI_Host_Controller_0000:63:00.3
++E: ID_SERIAL_SHORT=0000:63:00.3
++E: ID_USB_INTERFACES=:090000:
++E: ID_USB_MODEL=xHCI_Host_Controller
++E: ID_USB_MODEL_ENC=xHCI\x20Host\x20Controller
++E: ID_USB_MODEL_ID=0002
++E: ID_USB_REVISION=0702
++E: ID_USB_SERIAL=Linux_7.2.4-arch1-2_xhci-hcd_xHCI_Host_Controller_0000:63:00.3
++E: ID_USB_SERIAL_SHORT=0000:63:00.3
++E: ID_USB_VENDOR=Linux_7.2.4-arch1-2_xhci-hcd
++E: ID_USB_VENDOR_ENC=Linux\x207.2.4-arch1-2\x20xhci-hcd
++E: ID_USB_VENDOR_ID=1d6b
++E: ID_VENDOR=Linux_7.2.4-arch1-2_xhci-hcd
++E: ID_VENDOR_ENC=Linux\x207.2.4-arch1-2\x20xhci-hcd
++E: ID_VENDOR_FROM_DATABASE=Linux Foundation
++E: ID_VENDOR_ID=1d6b
++E: MAJOR=189
++E: MINOR=0
++E: PRODUCT=1d6b/2/702
++E: SUBSYSTEM=usb
++E: TAGS=:seat:
++E: TYPE=9/0/1
++A: authorized=1\n
++A: authorized_default=1\n
++A: avoid_reset_quirk=0\n
++A: bConfigurationValue=1\n
++A: bDeviceClass=09\n
++A: bDeviceProtocol=01\n
++A: bDeviceSubClass=00\n
++A: bMaxPacketSize0=64\n
++A: bMaxPower=0mA\n
++A: bNumConfigurations=1\n
++A: bNumInterfaces= 1\n
++A: bcdDevice=0702\n
++A: bmAttributes=e0\n
++A: busnum=1\n
++A: configuration=
++H: descriptors=12010002090001406B1D020002070302010109021900010100E0000904000001090000000705810304000C
++A: dev=189:0\n
++A: devnum=1\n
++A: devpath=0\n
++L: driver=../../../../../bus/usb/drivers/usb
++L: firmware_node=../../../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:17/device:23/device:24
++A: idProduct=0002\n
++A: idVendor=1d6b\n
++A: interface_authorized_default=1\n
++A: ltm_capable=no\n
++A: manufacturer=Linux 7.2.4-arch1-2 xhci-hcd\n
++A: maxchild=5\n
++A: power/active_duration=21820915\n
++A: power/autosuspend=0\n
++A: power/autosuspend_delay_ms=0\n
++A: power/connected_duration=25152871\n
++A: power/control=auto\n
++A: power/level=auto\n
++A: power/runtime_active_time=21820914\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=3331956\n
++A: power/wakeup=disabled\n
++A: power/wakeup_abort_count=\n
++A: power/wakeup_active=\n
++A: power/wakeup_active_count=\n
++A: power/wakeup_count=\n
++A: power/wakeup_expire_count=\n
++A: power/wakeup_last_time_ms=\n
++A: power/wakeup_max_time_ms=\n
++A: power/wakeup_total_time_ms=\n
++A: product=xHCI Host Controller\n
++A: quirks=0x0\n
++A: removable=unknown\n
++A: rx_lanes=1\n
++A: serial=0000:63:00.3\n
++A: speed=480\n
++A: tx_lanes=1\n
++A: urbnum=705\n
++A: version= 2.00\n
++
++P: /devices/pci0000:00/0000:00:08.1/0000:63:00.3
++E: DRIVER=xhci_hcd
++E: ID_PATH=pci-0000:63:00.3
++E: ID_PATH_TAG=pci-0000_63_00_3
++E: ID_PCI_CLASS_FROM_DATABASE=Serial bus controller
++E: ID_PCI_INTERFACE_FROM_DATABASE=XHCI
++E: ID_PCI_SUBCLASS_FROM_DATABASE=USB controller
++E: ID_VENDOR_FROM_DATABASE=Advanced Micro Devices, Inc. [AMD]
++E: MODALIAS=pci:v00001022d000015B9sv00001022sd000015B9bc0Csc03i30
++E: PCI_CLASS=C0330
++E: PCI_ID=1022:15B9
++E: PCI_SLOT_NAME=0000:63:00.3
++E: PCI_SUBSYS_ID=1022:15B9
++E: SUBSYSTEM=pci
++A: ari_enabled=0\n
++A: broken_parity_status=0\n
++A: class=0x0c0330\n
++H: config=2210B915070410000030030C10008000040020780000000000000000000000000000000000000000000000002210B915000000004800000000000000FF0400000000000000000000095008002210B915016403C80000000000000000000000003160000010A00200A18F000010290000040D400040000411000000000000000000000000000000001F007100000000001E00800100000100000000000000000005C08000000000000000000000000000000000000000000000000000000000001100008000E00F0000F00F00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000B00012A010001010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000D000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++A: consistent_dma_mask_bits=64\n
++A: current_link_speed=16.0 GT/s PCIe\n
++A: current_link_width=16\n
++A: d3cold_allowed=1\n
++A: dbc=disabled\n
++A: dbc_bInterfaceProtocol=01\n
++A: dbc_bcdDevice=0010\n
++A: dbc_idProduct=0010\n
++A: dbc_idVendor=1d6b\n
++A: dbc_manufacturer=Linux Foundation\n
++A: dbc_poll_interval_ms=64\n
++A: dbc_product=Linux USB Debug Target\n
++A: dbc_serial=0001\n
++A: device=0x15b9\n
++A: dma_mask_bits=64\n
++L: driver=../../../../bus/pci/drivers/xhci_hcd
++A: driver_override=(null)\n
++A: enable=1\n
++L: firmware_node=../../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:17/device:23
++L: iommu=../../0000:00:00.2/iommu/ivhd0
++L: iommu_group=../../../../kernel/iommu_groups/19
++A: irq=45\n
++A: link/l0s_aspm=0\n
++A: link/l1_aspm=0\n
++A: local_cpulist=0-15\n
++A: local_cpus=ffff\n
++A: max_link_speed=16.0 GT/s PCIe\n
++A: max_link_width=16\n
++A: modalias=pci:v00001022d000015B9sv00001022sd000015B9bc0Csc03i30\n
++A: msi_bus=1\n
++A: msi_irqs/46=msix\n
++A: numa_node=-1\n
++A: pools=poolinfo - 0.1\nbuffer-2048         0    0 2048  0\nbuffer-512          0    0  512  0\nbuffer-128          0    0  128  0\nbuffer-32           0    0   32  0\nxHCI 256 port bw ctx arrays    0    0  256  0\nxHCI 1KB stream ctx arrays    0    0 1024  0\nxHCI 256 byte stream ctx arrays    0    0  256  0\nxHCI input/output contexts    4    5 2112  5\nxHCI ring segments   25   29 4096 29\nbuffer-2048         0    0 2048  0\nbuffer-512          0    8  512  1\nbuffer-128          0    0  128  0\nbuffer-32           0    0   32  0\n
++A: power/control=auto\n
++A: power/runtime_active_time=21821680\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=3331381\n
++A: power/wakeup=enabled\n
++A: power/wakeup_abort_count=0\n
++A: power/wakeup_active=0\n
++A: power/wakeup_active_count=0\n
++A: power/wakeup_count=0\n
++A: power/wakeup_expire_count=0\n
++A: power/wakeup_last_time_ms=0\n
++A: power/wakeup_max_time_ms=0\n
++A: power/wakeup_total_time_ms=0\n
++A: power_state=D0\n
++A: reset_method=pm\n
++A: resource=0x0000000078200000 0x00000000782fffff 0x0000000000140204\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n
++A: revision=0x00\n
++A: subsystem_device=0x15b9\n
++A: subsystem_vendor=0x1022\n
++A: vendor=0x1022\n
++
++P: /devices/pci0000:00/0000:00:08.1
++E: DRIVER=pcieport
++E: ID_MODEL_FROM_DATABASE=Phoenix Internal GPP Bridge to Bus [C:A]
++E: ID_PATH=pci-0000:00:08.1
++E: ID_PATH_TAG=pci-0000_00_08_1
++E: ID_PCI_CLASS_FROM_DATABASE=Bridge
++E: ID_PCI_INTERFACE_FROM_DATABASE=Normal decode
++E: ID_PCI_SUBCLASS_FROM_DATABASE=PCI bridge
++E: ID_VENDOR_FROM_DATABASE=Advanced Micro Devices, Inc. [AMD]
++E: MODALIAS=pci:v00001022d000014EBsv00001022sd000014EBbc06sc04i00
++E: PCI_CLASS=60400
++E: PCI_ID=1022:14EB
++E: PCI_SLOT_NAME=0000:00:08.1
++E: PCI_SUBSYS_ID=1022:14EB
++E: SUBSYSTEM=pci
++A: ari_enabled=0\n
++A: broken_parity_status=0\n
++A: class=0x060400\n
++H: config=2210EB140704100000000406100081000000000000000000006363001111000000785078010071107C0000007C000000000000005000000000000000FF01020000000000000000000000000000000000015803C80000000010A042002280000010290000040D7000400C04310000000000004000180001000000000040003100000000001E00800144001F00000000000000000000000000000000000000000005C081000000E0FE0000000000000000000000000000000000000000000000000D0000002210EB1400000000000000000000000000000000000000000000000000000000FC27FF9F0000000000000000000000000000000000000000000000000B000127010001010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001900012A00000000000000007F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F000000000D0001405F001D000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000250001410100008001000080000000002600014500000000000000000F00000000000000000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF000000000000000000000000000000002700010000000000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++A: consistent_dma_mask_bits=32\n
++A: current_link_speed=16.0 GT/s PCIe\n
++A: current_link_width=16\n
++A: d3cold_allowed=1\n
++A: device=0x14eb\n
++A: dma_mask_bits=32\n
++L: driver=../../../bus/pci/drivers/pcieport
++A: driver_override=(null)\n
++A: enable=2\n
++L: firmware_node=../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:17
++L: iommu=../0000:00:00.2/iommu/ivhd0
++L: iommu_group=../../../kernel/iommu_groups/8
++A: irq=42\n
++A: local_cpulist=0-15\n
++A: local_cpus=ffff\n
++A: max_link_speed=16.0 GT/s PCIe\n
++A: max_link_width=16\n
++A: modalias=pci:v00001022d000014EBsv00001022sd000014EBbc06sc04i00\n
++A: msi_bus=1\n
++A: msi_irqs/42=msi\n
++A: numa_node=-1\n
++A: power/autosuspend_delay_ms=100\n
++A: power/control=auto\n
++A: power/runtime_active_time=25153067\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=0\n
++A: power/wakeup=disabled\n
++A: power/wakeup_abort_count=\n
++A: power/wakeup_active=\n
++A: power/wakeup_active_count=\n
++A: power/wakeup_count=\n
++A: power/wakeup_expire_count=\n
++A: power/wakeup_last_time_ms=\n
++A: power/wakeup_max_time_ms=\n
++A: power/wakeup_total_time_ms=\n
++A: power_state=D0\n
++A: reset_method=pm\n
++A: resource=0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000001000 0x0000000000001fff 0x0000000000000101\n0x0000000078000000 0x00000000785fffff 0x0000000000000200\n0x0000007c00000000 0x0000007c107fffff 0x0000000000102201\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n
++A: revision=0x00\n
++A: secondary_bus_number=99\n
++A: subordinate_bus_number=99\n
++A: subsystem_device=0x14eb\n
++A: subsystem_vendor=0x1022\n
++A: vendor=0x1022\n
++
+-- 
+2.55.0
+

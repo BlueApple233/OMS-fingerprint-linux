@@ -1,0 +1,48 @@
+# Maintainer: BlueApple233 <blueapple233_@outlook.com>
+#
+# libfprint with the OMS match-on-chip driver (USB 33a7:2388) added.
+# The driver itself is submitted upstream; this package is the fallback for
+# users whose device is not supported by the distribution package yet.
+#
+# See https://github.com/BlueApple233/OMS-fingerprint-linux
+
+pkgname=libfprint-omsmoc
+pkgver=1.94.100
+pkgrel=1
+pkgdesc="Library to access fingerprint readers, with the OMS match-on-chip driver (33a7:2388)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/BlueApple233/OMS-fingerprint-linux"
+license=('LGPL-2.1-or-later')
+depends=('glib2' 'libgudev' 'libgusb' 'libusb' 'openssl' 'pixman' 'cairo')
+makedepends=('meson' 'ninja' 'gobject-introspection' 'glib2-devel')
+provides=('libfprint')
+conflicts=('libfprint')
+options=('!emptydirs')
+source=("https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v$pkgver/libfprint-v$pkgver.tar.gz"
+        "omsmoc-driver.patch")
+sha256sums=('edc90e02f330a7595ceaf37f2c6ec32ed43541347fe936d3273b0bb2524fd19c'
+            'd2d633d5ba13e7f193c12eb1d1782210caa66113b9250457462771eb80f3dd14')
+
+prepare() {
+  cd "libfprint-v$pkgver"
+  patch -Np1 -i "$srcdir/omsmoc-driver.patch"
+}
+
+build() {
+  cd "libfprint-v$pkgver"
+  meson setup build \
+    --prefix=/usr \
+    --buildtype=release \
+    -Ddrivers=default \
+    -Ddoc=false \
+    -Dgtk-examples=false \
+    -Dinstalled-tests=false \
+    -Dudev_rules=enabled \
+    -Dudev_hwdb=enabled
+  meson compile -C build
+}
+
+package() {
+  cd "libfprint-v$pkgver"
+  meson install -C build --destdir "$pkgdir"
+}

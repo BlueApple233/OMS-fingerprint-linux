@@ -1,0 +1,56 @@
+# ============================================================
+# OMS 指纹模块 Linux 驱动项目 — Git 忽略规则
+# 依据 ROADMAP.md 第 7 节「合规边界」制定
+# ============================================================
+
+# --- 厂商二进制（不可发布，见 ROADMAP §7）---
+# 分析对象：OEM 提供的 Windows 驱动包，内含厂商 DLL 与传感器固件。
+# git 历史难以彻底清除，故此文件不纳入版本控制；请自行留存于工作目录。
+06OMS_*.zip
+
+# 手工解压后的厂商二进制目录（本应解压到工作目录之外，此处为兜底）
+OMS_*/
+Goodix/
+PixelAuth/
+ACM32FP.bin
+*FpDriver.dll
+*EngineAdapter.dll
+
+# --- 抓包数据（可能含密钥材料与设备隐私数据）---
+# 原始流量不纳入版本控制；由抓包得出的解码笔记（.md）应当提交。
+captures/*.pcap
+captures/*.pcapng
+captures/*.bin
+captures/*.raw
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+# 本机虚拟环境（pyusb 等依赖装在这里，不随仓库分发）
+.venv/
+
+# --- 本地工具状态 ---
+# Command Code 的权限配置与自动学习的偏好，属本机状态，不随项目分发。
+.commandcode/
+
+# --- 编辑器 / 系统 ---
+*.swp
+.DS_Store
+
+# --- 本地构建目录 ---
+# libfprint 源码树与 meson 构建产物（由 driver/setup.sh 生成，可随时重建）
+build/
+
+# --- 内部资料（本地保留，不上传公开仓库）---
+# 公开仓库只放对外材料：README/LICENSE + driver/（驱动、测试、上游补丁）+ aur/
+/ROADMAP.md
+/agents.md
+/AGENTS.md
+/vm/
+/phase0-protocol-draft.md
+/phase1-findings.md
+/phase2-findings.md
+/phase3-findings.md
+/captures/
+/prototype/
+/tools/
